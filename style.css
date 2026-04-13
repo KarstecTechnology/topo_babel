@@ -125,17 +125,24 @@ input[type="file"] {
   color: #444;
 }
 
-.form-group input {
+.form-group input,
+.form-group select {
   padding: 8px 10px;
   border: 1px solid #ccc;
   border-radius: 5px;
   font-size: 0.95rem;
   outline: none;
   transition: border-color 0.2s;
+  background: #fff;
 }
 
-.form-group input:focus {
+.form-group input:focus,
+.form-group select:focus {
   border-color: #1a3a5c;
+}
+
+.export-format-group {
+  margin-bottom: 16px;
 }
 
 /* Preview */

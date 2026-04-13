@@ -4,9 +4,10 @@ A tool to convert cave survey files from one format to another. It is built on t
 
 ## Supported formats:
 - Currently, topo_babel supports the following formats:
-    + vtopo files -> caverender files
+    + vtopo files -> CaveRender project XML files
+    + vtopo files -> CaveRender survey data TXT files
 
 - More formats will be added in the future.
 
 ## Usage:
-Topo babel can be used as a command-line tool or with the web interface. It's built with JavaScript and can be run in any modern web browser.
+Topo babel can be used with the web interface. Load a `.tro` file, review the detected cave metadata, choose the export format, and download either a CaveRender project XML or survey-data TXT file.

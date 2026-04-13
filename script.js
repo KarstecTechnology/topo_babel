@@ -27,7 +27,7 @@ function parseTroHeader(troText) {
         info.name = caveName;
         // Use the first word as the short name (höhle)
         const parts = caveName.split(/\s+/);
-        info.höhle = parts[0] || caveName;
+        info.höhle = (parts[0] || caveName).replace(/:$/, '');
       }
       continue;
     }
@@ -84,36 +84,51 @@ function parseLRUD(val) {
   return isNaN(f) ? 0.0 : f;
 }
 
-/**
- * Returns true only for real survey shots — skips header lines, splay shots
- * (to-station == "*"), and lines that do not have a numeric length field.
- */
-function isDataLine(parts) {
-  if (parts.length < 9) return false;
-  if (isNaN(parseFloat(parts[2]))) return false;
-  if (parts[1] === '*') return false; // splay / wall-distance shot
-  return true;
+function formatNumber(value) {
+  return Number(value).toFixed(2);
 }
 
-/**
- * Convert VTopo .tro text to CaveRenderPro XML string.
- */
-function troToCaveRenderXML(troText, caveInfo) {
-  caveInfo = Object.assign({
+function formatSurveyDate(dateValue) {
+  if (!dateValue) return '';
+  const match = String(dateValue).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return String(dateValue);
+  const [, year, month, day] = match;
+  return `${month}/${day}/${year}`;
+}
+
+function normalizeCaveInfo(caveInfo) {
+  return Object.assign({
     cave_id: 0,
     kataster: 0,
     höhle: 'Unknown',
     name: 'Unknown Cave',
     datum: new Date().toISOString().slice(0, 10)
   }, caveInfo);
+}
 
+function calculateTargetCoordinates(origin, length, azimuthDegrees, inclinationDegrees) {
+  const azimuth = azimuthDegrees * Math.PI / 180;
+  const inclination = inclinationDegrees * Math.PI / 180;
+  const horizontal = length * Math.cos(inclination);
+
+  return {
+    x: origin.x + horizontal * Math.sin(azimuth),
+    y: origin.y + horizontal * Math.cos(azimuth),
+    z: origin.z + length * Math.sin(inclination)
+  };
+}
+
+function getDefaultStationLabel(gang, punkt) {
+  return gang > 0 ? `${gang}.${punkt}` : String(punkt);
+}
+
+function parseSurveyShots(troText) {
   const lines = troText.split(/\r?\n/);
-  let xmlLines = '';
-  let id = 0;
+  const shots = [];
+  const stationCoords = new Map();
 
   for (const line of lines) {
     const trimmed = line.trim();
-    // Skip blank lines, comments, and all keyword header lines
     if (
       !trimmed ||
       trimmed.startsWith('*') ||
@@ -134,16 +149,75 @@ function troToCaveRenderXML(troText, caveInfo) {
     if (!isDataLine(parts)) continue;
 
     const fromStation = parseStation(parts[0]);
-    const toStation   = parseStation(parts[1]);
+    const toStation = parseStation(parts[1]);
     if (!fromStation || !toStation) continue;
 
-    const length      = parseFloat(parts[2]);
-    const azimuth     = parseFloat(parts[3]);
+    const length = parseFloat(parts[2]);
+    const azimuth = parseFloat(parts[3]);
     const inclination = parseFloat(parts[4]);
-    const left        = parseLRUD(parts[5]);
-    const right       = parseLRUD(parts[6]);
-    const up          = parseLRUD(parts[7]);
-    const down        = parseLRUD(parts[8]);
+    const left = parseLRUD(parts[5]);
+    const right = parseLRUD(parts[6]);
+    const up = parseLRUD(parts[7]);
+    const down = parseLRUD(parts[8]);
+    const fromKey = `${fromStation.gang}:${fromStation.punkt}`;
+    const toKey = `${toStation.gang}:${toStation.punkt}`;
+    const origin = stationCoords.get(fromKey) || { x: 0, y: 0, z: 0 };
+    const target = calculateTargetCoordinates(origin, length, azimuth, inclination);
+
+    if (!stationCoords.has(fromKey)) {
+      stationCoords.set(fromKey, origin);
+    }
+    if (!stationCoords.has(toKey)) {
+      stationCoords.set(toKey, target);
+    }
+
+    shots.push({
+      fromStation,
+      toStation,
+      fromRaw: parts[0],
+      toRaw: parts[1],
+      length,
+      azimuth,
+      inclination,
+      left,
+      right,
+      up,
+      down,
+      refX: origin.x,
+      refY: origin.y,
+      refZ: origin.z,
+      x: target.x,
+      y: target.y,
+      z: target.z
+    });
+  }
+
+  return shots;
+}
+
+/**
+ * Returns true only for real survey shots — skips header lines, splay shots
+ * (to-station == "*"), and lines that do not have a numeric length field.
+ */
+function isDataLine(parts) {
+  if (parts.length < 9) return false;
+  if (isNaN(parseFloat(parts[2]))) return false;
+  if (parts[1] === '*') return false; // splay / wall-distance shot
+  return true;
+}
+
+/**
+ * Convert VTopo .tro text to CaveRenderPro XML string.
+ */
+function troToCaveRenderXML(troText, caveInfo) {
+  caveInfo = normalizeCaveInfo(caveInfo);
+  const shots = parseSurveyShots(troText);
+  let xmlLines = '';
+  let id = 0;
+
+  for (const shot of shots) {
+    const fromStation = shot.fromStation;
+    const toStation = shot.toStation;
 
     xmlLines += `
   <line>
@@ -160,14 +234,14 @@ function troToCaveRenderXML(troText, caveInfo) {
     <ende>0.0</ende>
     <tiefe>0.0</tiefe>
     <refTiefe>0.0</refTiefe>
-    <länge>${length}</länge>
-    <azimut>${azimuth}</azimut>
-    <neigung>${inclination}</neigung>
+    <länge>${shot.length}</länge>
+    <azimut>${shot.azimuth}</azimut>
+    <neigung>${shot.inclination}</neigung>
     <querschnitt>0</querschnitt>
-    <links>${left}</links>
-    <rechts>${right}</rechts>
-    <oben>${up}</oben>
-    <unten>${down}</unten>
+    <links>${shot.left}</links>
+    <rechts>${shot.right}</rechts>
+    <oben>${shot.up}</oben>
+    <unten>${shot.down}</unten>
     <gerät>4</gerät>
     <richtung>1.0</richtung>
     <gewicht>0.0</gewicht>
@@ -182,12 +256,12 @@ function troToCaveRenderXML(troText, caveInfo) {
     <maßnahmen></maßnahmen>
     <bemerkung></bemerkung>
     <refHöhle></refHöhle>
-    <refX>0.0</refX>
-    <refY>0.0</refY>
-    <refZ>0.0</refZ>
-    <x>0.0</x>
-    <y>0.0</y>
-    <z>0.0</z>
+    <refX>${shot.refX}</refX>
+    <refY>${shot.refY}</refY>
+    <refZ>${shot.refZ}</refZ>
+    <x>${shot.x}</x>
+    <y>${shot.y}</y>
+    <z>${shot.z}</z>
     <profil>0</profil>
     <profilX>0.0</profilX>
     <profilY>0.0</profilY>
@@ -211,6 +285,73 @@ function troToCaveRenderXML(troText, caveInfo) {
   return xmlHeader + xmlLines + '\n</CaveRenderPro>';
 }
 
+function troToCaveRenderSurveyText(troText, caveInfo) {
+  caveInfo = normalizeCaveInfo(caveInfo);
+  const shots = parseSurveyShots(troText);
+  const surveyDate = formatSurveyDate(caveInfo.datum);
+  const caveKey = caveInfo.höhle || caveInfo.name;
+  const rows = [
+    [
+      'Cave', 'RefPassage', 'RefStation', 'Passage', 'Station', 'Start', 'End', 'Depth',
+      'Length', 'Azimuth', 'Inclination', 'LRUDs', 'Left', 'Right', 'Up', 'Down',
+      'ProfileX', 'ProfileY', 'Profile', 'Instrument', 'Direction', 'Weight', 'Loop',
+      'Colour', 'Level', 'Date', 'Surveyor', 'Title', 'Info', 'Material', 'Tasks',
+      'Comment', 'RefCave', 'RefX', 'RefY', 'RefZ', 'X', 'Y', 'Z', 'State'
+    ].join('\t')
+  ];
+
+  for (const shot of shots) {
+    const title = shot.fromStation.gang === 0 && shot.fromStation.punkt === 0 && shot.toStation.gang === 0 && shot.toStation.punkt === 0
+      ? caveInfo.name
+      : '';
+
+    rows.push([
+      caveKey,
+      shot.fromStation.gang,
+      shot.fromStation.punkt,
+      shot.toStation.gang,
+      shot.toStation.punkt,
+      0,
+      0,
+      '0.00',
+      formatNumber(shot.length),
+      String(shot.azimuth),
+      String(shot.inclination),
+      0,
+      formatNumber(shot.left),
+      formatNumber(shot.right),
+      formatNumber(shot.up),
+      formatNumber(shot.down),
+      '0.00',
+      '0.00',
+      0,
+      4,
+      1,
+      0,
+      0,
+      4,
+      1,
+      surveyDate,
+      0,
+      title,
+      '',
+      '',
+      '',
+      '',
+      '',
+      formatNumber(shot.refX),
+      formatNumber(shot.refY),
+      formatNumber(shot.refZ),
+      formatNumber(shot.x),
+      formatNumber(shot.y),
+      formatNumber(shot.z),
+      ''
+    ].join('\t'));
+  }
+
+  return rows.join('\n');
+}
+
 /** Escape special XML characters. */
 function escapeXml(str) {
   return String(str)
@@ -223,6 +364,29 @@ function escapeXml(str) {
 
 /** Module-level storage for the loaded .tro file text. */
 let currentTroText = null;
+
+function getSelectedExportFormat() {
+  return document.getElementById('exportFormat').value;
+}
+
+function onExportFormatChanged() {
+  const format = getSelectedExportFormat();
+  const convertBtn = document.getElementById('convertBtn');
+  const downloadLink = document.getElementById('downloadLink');
+
+  if (format === 'survey') {
+    convertBtn.textContent = 'Convert to CaveRender survey data TXT';
+    if (downloadLink.style.display !== 'none') {
+      downloadLink.textContent = 'Download TXT';
+    }
+    return;
+  }
+
+  convertBtn.textContent = 'Convert to CaveRender project XML';
+  if (downloadLink.style.display !== 'none') {
+    downloadLink.textContent = 'Download XML';
+  }
+}
 
 /** Show a status message. */
 function showStatus(message, type) {
@@ -299,10 +463,15 @@ function convertFile() {
     name:     document.getElementById('caveName').value   || 'Unknown Cave',
     datum:    document.getElementById('caveDate').value   || new Date().toISOString().slice(0, 10)
   };
+  const exportFormat = getSelectedExportFormat();
+  const content = exportFormat === 'survey'
+    ? troToCaveRenderSurveyText(currentTroText, caveInfo)
+    : troToCaveRenderXML(currentTroText, caveInfo);
+  const mimeType = exportFormat === 'survey'
+    ? 'text/tab-separated-values;charset=utf-8'
+    : 'application/xml;charset=utf-8';
 
-  const xml = troToCaveRenderXML(currentTroText, caveInfo);
-
-  const blob = new Blob([xml], { type: 'application/xml;charset=utf-8' });
+  const blob = new Blob([content], { type: mimeType });
   const url  = URL.createObjectURL(blob);
 
   const link = document.getElementById('downloadLink');
@@ -311,11 +480,17 @@ function convertFile() {
     URL.revokeObjectURL(link.href);
   }
   link.href = url;
-  // Suggest a filename based on the input file name
   const inputName = fileInput.files[0].name.replace(/\.tro$/i, '');
-  link.download = inputName + '_caverender.xml';
+  link.download = exportFormat === 'survey'
+    ? inputName + '_caverender_survey.txt'
+    : inputName + '_caverender.xml';
   link.style.display = 'inline-block';
-  link.textContent = '⬇ Download XML';
+  link.textContent = exportFormat === 'survey' ? 'Download TXT' : 'Download XML';
 
-  showStatus('Conversion complete! Click the download button to save the XML file.', 'success');
+  showStatus(
+    exportFormat === 'survey'
+      ? 'Conversion complete. Download the CaveRender survey-data TXT file.'
+      : 'Conversion complete. Download the CaveRender project XML file.',
+    'success'
+  );
 }
