@@ -40,7 +40,6 @@ function parseTroHeader(troText) {
         const [, dd, mm, yyyy] = dateMatch;
         const day = parseInt(dd, 10);
         const month = parseInt(mm, 10);
-        const year = parseInt(yyyy, 10);
         // Basic validation: month must be 1-12, day must be 1-31
         if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
           info.datum = `${yyyy}-${mm}-${dd}`;
@@ -50,6 +49,50 @@ function parseTroHeader(troText) {
   }
 
   return info;
+}
+
+/**
+ * Parse a VTopo station label into {gang, punkt}.
+ *
+ * VTopo uses two notations:
+ *   - "series.station"  (Toporobot style): e.g. "1.6"  → {gang:1, punkt:6}
+ *   - plain integer:    e.g. "500"         → {gang:0, punkt:500}
+ *
+ * Returns null for splay markers ("*").
+ */
+function parseStation(stationStr) {
+  const s = String(stationStr).trim();
+  if (s === '*') return null;
+
+  const dotIdx = s.indexOf('.');
+  if (dotIdx !== -1) {
+    const gang  = parseInt(s.slice(0, dotIdx), 10) || 0;
+    const punkt = parseInt(s.slice(dotIdx + 1), 10) || 0;
+    return { gang, punkt };
+  }
+
+  // Plain integer or integer with trailing letters (e.g. "907y") — extract leading digits
+  const num = parseInt(s, 10);
+  return { gang: 0, punkt: isNaN(num) ? 0 : num };
+}
+
+/**
+ * Parse a LRUD value; returns 0.0 for unknown ("*") or non-numeric values.
+ */
+function parseLRUD(val) {
+  const f = parseFloat(val);
+  return isNaN(f) ? 0.0 : f;
+}
+
+/**
+ * Returns true only for real survey shots — skips header lines, splay shots
+ * (to-station == "*"), and lines that do not have a numeric length field.
+ */
+function isDataLine(parts) {
+  if (parts.length < 9) return false;
+  if (isNaN(parseFloat(parts[2]))) return false;
+  if (parts[1] === '*') return false; // splay / wall-distance shot
+  return true;
 }
 
 /**
@@ -68,12 +111,13 @@ function troToCaveRenderXML(troText, caveInfo) {
   let xmlLines = '';
   let id = 0;
 
-  lines.forEach(line => {
+  for (const line of lines) {
     const trimmed = line.trim();
-    // Skip header and comment lines
+    // Skip blank lines, comments, and all keyword header lines
     if (
       !trimmed ||
       trimmed.startsWith('*') ||
+      trimmed.startsWith('[') ||
       trimmed.startsWith('Version') ||
       trimmed.startsWith('Verification') ||
       trimmed.startsWith('Trou') ||
@@ -83,32 +127,47 @@ function troToCaveRenderXML(troText, caveInfo) {
       trimmed.startsWith('Couleur') ||
       trimmed.startsWith('Param')
     ) {
-      return;
+      continue;
     }
 
     const parts = trimmed.split(/\s+/);
-    // Data lines have at least 9 columns; column 2 (length) must be numeric
-    if (parts.length >= 9 && !isNaN(parseFloat(parts[2]))) {
-      const [from, to, length, azimuth, inclination, left, right, up, down] = parts;
-      xmlLines += `
+    if (!isDataLine(parts)) continue;
+
+    const fromStation = parseStation(parts[0]);
+    const toStation   = parseStation(parts[1]);
+    if (!fromStation || !toStation) continue;
+
+    const length      = parseFloat(parts[2]);
+    const azimuth     = parseFloat(parts[3]);
+    const inclination = parseFloat(parts[4]);
+    const left        = parseLRUD(parts[5]);
+    const right       = parseLRUD(parts[6]);
+    const up          = parseLRUD(parts[7]);
+    const down        = parseLRUD(parts[8]);
+
+    xmlLines += `
   <line>
     <cave_id>${caveInfo.cave_id}</cave_id>
     <id>${id}</id>
+    <status></status>
     <kataster>${caveInfo.kataster}</kataster>
     <höhle>${escapeXml(caveInfo.höhle)}</höhle>
-    <gang>1</gang>
-    <punkt></punkt>
+    <refGang>${fromStation.gang}</refGang>
+    <refPunkt>${fromStation.punkt}</refPunkt>
+    <gang>${toStation.gang}</gang>
+    <punkt>${toStation.punkt}</punkt>
     <start>0.0</start>
     <ende>0.0</ende>
     <tiefe>0.0</tiefe>
     <refTiefe>0.0</refTiefe>
-    <länge>${parseFloat(length)}</länge>
-    <azimut>${parseFloat(azimuth)}</azimut>
-    <neigung>${parseFloat(inclination)}</neigung>
-    <links>${parseFloat(left)}</links>
-    <rechts>${parseFloat(right)}</rechts>
-    <oben>${parseFloat(up)}</oben>
-    <unten>${parseFloat(down)}</unten>
+    <länge>${length}</länge>
+    <azimut>${azimuth}</azimut>
+    <neigung>${inclination}</neigung>
+    <querschnitt>0</querschnitt>
+    <links>${left}</links>
+    <rechts>${right}</rechts>
+    <oben>${up}</oben>
+    <unten>${down}</unten>
     <gerät>4</gerät>
     <richtung>1.0</richtung>
     <gewicht>0.0</gewicht>
@@ -134,9 +193,8 @@ function troToCaveRenderXML(troText, caveInfo) {
     <profilY>0.0</profilY>
     <linked>VORWÄRTS</linked>
   </line>`;
-      id++;
-    }
-  });
+    id++;
+  }
 
   const xmlHeader = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <CaveRenderPro>
@@ -187,30 +245,30 @@ function onFileSelected(input) {
   reader.onload = function(e) {
     const troText = e.target.result;
 
-    // Count data lines for preview
+    // Count real survey shots (skip header lines and splay shots)
     const lines = troText.split(/\r?\n/);
     let dataLines = 0;
-    lines.forEach(line => {
+    for (const line of lines) {
       const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('*') || /^[A-Za-z]/.test(trimmed)) return;
+      if (!trimmed || /^[A-Za-z\[*]/.test(trimmed)) continue;
       const parts = trimmed.split(/\s+/);
-      if (parts.length >= 9 && !isNaN(parseFloat(parts[2]))) dataLines++;
-    });
+      if (isDataLine(parts)) dataLines++;
+    }
 
     // Parse header info
     const info = parseTroHeader(troText);
 
     // Pre-fill form fields
-    document.getElementById('caveName').value = info.name || '';
-    document.getElementById('caveHöhle').value = info.höhle || '';
+    document.getElementById('caveName').value    = info.name    || '';
+    document.getElementById('caveHöhle').value   = info.höhle  || '';
     document.getElementById('caveKataster').value = info.kataster || 0;
-    document.getElementById('caveDate').value = info.datum || '';
+    document.getElementById('caveDate').value    = info.datum   || '';
 
     // Update preview
     document.getElementById('preview').innerHTML =
       `<strong>File:</strong> ${escapeXml(file.name)}<br>` +
       `<strong>Survey shots detected:</strong> ${dataLines}<br>` +
-      (info.name ? `<strong>Cave name (from header):</strong> ${escapeXml(info.name)}<br>` : '') +
+      (info.name  ? `<strong>Cave name (from header):</strong> ${escapeXml(info.name)}<br>`  : '') +
       (info.datum ? `<strong>Date (from header):</strong> ${escapeXml(info.datum)}<br>` : '');
 
     // Show steps 2 and 3
@@ -237,15 +295,15 @@ function convertFile() {
   const caveInfo = {
     cave_id: 0,
     kataster: parseInt(document.getElementById('caveKataster').value, 10) || 0,
-    höhle: document.getElementById('caveHöhle').value || 'Unknown',
-    name: document.getElementById('caveName').value || 'Unknown Cave',
-    datum: document.getElementById('caveDate').value || new Date().toISOString().slice(0, 10)
+    höhle:    document.getElementById('caveHöhle').value  || 'Unknown',
+    name:     document.getElementById('caveName').value   || 'Unknown Cave',
+    datum:    document.getElementById('caveDate').value   || new Date().toISOString().slice(0, 10)
   };
 
   const xml = troToCaveRenderXML(currentTroText, caveInfo);
 
   const blob = new Blob([xml], { type: 'application/xml;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
+  const url  = URL.createObjectURL(blob);
 
   const link = document.getElementById('downloadLink');
   // Revoke previous object URL if any

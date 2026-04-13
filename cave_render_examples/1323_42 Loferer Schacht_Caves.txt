@@ -1,0 +1,2 @@
+Cave	Name	Info	Latitude	Longitude	Elevation	UTM Zone	Easting	Northing	Length	Depth	High	Low
+1323/42	Loferer Schacht		47.5495614	12.6394560	2035.57	33T	322391.12	5268938.15	8583.64	-796.67	0.00	-796.67
