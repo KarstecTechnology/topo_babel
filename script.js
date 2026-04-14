@@ -312,7 +312,7 @@ function parseSvxShots(svxText) {
 
   const TAPE_SYNONYMS    = ['tape', 'length', 'distance'];
   const COMPASS_SYNONYMS = ['compass', 'bearing'];
-  const CLINO_SYNONYMS   = ['clino', 'gradient', 'angle'];
+  const CLINO_SYNONYMS   = ['clino', 'gradient'];
   const UP_SYNONYMS      = ['up', 'ceiling'];
   const DOWN_SYNONYMS    = ['down', 'floor'];
   const LRUD_QUANTITIES  = ['left', 'right', 'up', 'down', 'ceiling', 'floor', 'lrud'];
@@ -388,11 +388,14 @@ function parseSvxShots(svxText) {
         else if (unit === 'minutes' || unit === 'min') factor = 1.0 / 60.0;
 
         const quantities = args.slice(0, -1);
+        // Angular-only units (grads, minutes) must not be applied to length quantities
+        const isAngularUnit = unit === 'grads' || unit === 'grad' || unit === 'gradians'
+          || unit === 'minutes' || unit === 'min';
         for (const q of quantities) {
-          if (TAPE_SYNONYMS.includes(q))    unitsTape    = factor;
-          else if (COMPASS_SYNONYMS.includes(q)) unitsCompass = factor;
-          else if (CLINO_SYNONYMS.includes(q))   unitsClino   = factor;
-          else if (LRUD_QUANTITIES.includes(q))  unitsLRUD    = factor;
+          if (!isAngularUnit && TAPE_SYNONYMS.includes(q))   unitsTape    = factor;
+          else if (COMPASS_SYNONYMS.includes(q))             unitsCompass = factor;
+          else if (CLINO_SYNONYMS.includes(q))               unitsClino   = factor;
+          else if (!isAngularUnit && LRUD_QUANTITIES.includes(q)) unitsLRUD = factor;
         }
       }
       continue;
