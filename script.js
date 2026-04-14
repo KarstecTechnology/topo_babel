@@ -207,11 +207,282 @@ function isDataLine(parts) {
 }
 
 /**
- * Convert VTopo .tro text to CaveRenderPro XML string.
+ * Parse the header of a Survex .svx file and return cave metadata.
  */
-function troToCaveRenderXML(troText, caveInfo) {
+function parseSvxHeader(svxText) {
+  const info = {
+    cave_id: 0,
+    kataster: 0,
+    höhle: '',
+    name: '',
+    datum: ''
+  };
+
+  const lines = svxText.split(/\r?\n/);
+  let foundFirstBegin = false;
+
+  for (const line of lines) {
+    const raw = line.trim();
+    if (!raw) continue;
+
+    // Strip inline comment
+    const commentIdx = raw.indexOf(';');
+    const trimmed = commentIdx !== -1 ? raw.slice(0, commentIdx).trim() : raw;
+    if (!trimmed) continue;
+
+    const lower = trimmed.toLowerCase();
+    const parts = trimmed.split(/\s+/);
+
+    // Cave name from first *begin with a label
+    if (!foundFirstBegin && lower.startsWith('*begin')) {
+      if (parts.length > 1) {
+        const caveName = parts.slice(1).join(' ');
+        info.name = caveName;
+        info.höhle = parts[1];
+        foundFirstBegin = true;
+      }
+      continue;
+    }
+
+    // Cave name from *title
+    if (!info.name && lower.startsWith('*title')) {
+      const titleMatch = trimmed.match(/\*title\s+"([^"]+)"/i) || trimmed.match(/\*title\s+(.+)/i);
+      if (titleMatch) {
+        info.name = titleMatch[1].trim();
+        if (!info.höhle) {
+          info.höhle = info.name.split(/\s+/)[0];
+        }
+      }
+      continue;
+    }
+
+    // Date: *date YYYY.MM.DD or YYYY-MM-DD
+    if (lower.startsWith('*date') && !info.datum) {
+      const dateMatch = trimmed.match(/(\d{4})[.\-\/](\d{1,2})[.\-\/](\d{1,2})/);
+      if (dateMatch) {
+        const [, yyyy, mm, dd] = dateMatch;
+        info.datum = `${yyyy}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`;
+      }
+    }
+  }
+
+  return info;
+}
+
+/**
+ * Parse survey shots from a Survex .svx file.
+ * Returns an array of shot objects in the same format as parseSurveyShots().
+ */
+function parseSvxShots(svxText) {
+  const shots = [];
+  const stationCoords = new Map();
+
+  // Series hierarchy tracking
+  const seriesStack = [];
+  const seriesIds = new Map();
+  let nextGangId = 1;
+
+  // Station ID tracking (for non-numeric station names)
+  const stationIds = new Map();
+  const stationCounters = new Map();
+
+  function getGangId(seriesPath) {
+    const key = seriesPath || '__root__';
+    if (!seriesIds.has(key)) {
+      seriesIds.set(key, nextGangId++);
+    }
+    return seriesIds.get(key);
+  }
+
+  function getPunktId(gang, stationName) {
+    // Use integer station names directly as punkt IDs
+    const numVal = parseInt(stationName, 10);
+    if (!isNaN(numVal) && String(numVal) === stationName.trim()) {
+      return numVal;
+    }
+    // Assign sequential IDs for non-numeric station names
+    const key = `${gang}:${stationName}`;
+    if (!stationIds.has(key)) {
+      const next = stationCounters.get(gang) || 1000;
+      stationIds.set(key, next);
+      stationCounters.set(gang, next + 1);
+    }
+    return stationIds.get(key);
+  }
+
+  const TAPE_SYNONYMS    = ['tape', 'length', 'distance'];
+  const COMPASS_SYNONYMS = ['compass', 'bearing'];
+  const CLINO_SYNONYMS   = ['clino', 'gradient', 'angle'];
+  const UP_SYNONYMS      = ['up', 'ceiling'];
+  const DOWN_SYNONYMS    = ['down', 'floor'];
+  const LRUD_QUANTITIES  = ['left', 'right', 'up', 'down', 'ceiling', 'floor', 'lrud'];
+
+  function findFieldIdx(fields, synonyms) {
+    return fields.findIndex(f => synonyms.includes(f));
+  }
+
+  // Current *data state
+  let dataType   = 'normal';
+  let dataFields = ['from', 'to', 'tape', 'compass', 'clino'];
+
+  // Unit conversion factors (to metres / degrees)
+  let unitsTape    = 1.0;
+  let unitsCompass = 1.0;
+  let unitsClino   = 1.0;
+  let unitsLRUD    = 1.0;
+
+  const lines = svxText.split(/\r?\n/);
+
+  for (const line of lines) {
+    const raw = line.trim();
+    if (!raw) continue;
+
+    // Strip inline comment
+    const commentIdx = raw.indexOf(';');
+    const trimmed = commentIdx !== -1 ? raw.slice(0, commentIdx).trim() : raw;
+    if (!trimmed) continue;
+
+    const lower = trimmed.toLowerCase();
+    const parts = trimmed.split(/\s+/);
+
+    // *begin [series]
+    if (lower.startsWith('*begin')) {
+      seriesStack.push(parts.length > 1 ? parts[1].toLowerCase() : '');
+      continue;
+    }
+
+    // *end [series]
+    if (lower.startsWith('*end')) {
+      if (seriesStack.length > 0) seriesStack.pop();
+      continue;
+    }
+
+    // *data [type] [fields…]
+    if (lower.startsWith('*data')) {
+      const args = parts.slice(1).map(p => p.toLowerCase());
+      if (args.length === 0 || args[0] === 'default') {
+        dataType   = 'normal';
+        dataFields = ['from', 'to', 'tape', 'compass', 'clino'];
+      } else if (args[0] === 'nosurvey') {
+        dataType = 'nosurvey';
+      } else if (args[0] === 'normal') {
+        dataType   = 'normal';
+        dataFields = args.slice(1);
+      } else {
+        // No explicit type keyword – treat all args as field names
+        dataType   = 'normal';
+        dataFields = args;
+      }
+      continue;
+    }
+
+    // *units quantity… unit
+    if (lower.startsWith('*units')) {
+      const args = parts.slice(1).map(p => p.toLowerCase());
+      if (args.length >= 2) {
+        const unit = args[args.length - 1];
+        let factor = 1.0;
+        if      (unit === 'feet' || unit === 'foot' || unit === 'ft') factor = 0.3048;
+        else if (unit === 'yards' || unit === 'yard' || unit === 'yd') factor = 0.9144;
+        else if (unit === 'grads' || unit === 'grad' || unit === 'gradians') factor = 0.9;
+        else if (unit === 'minutes' || unit === 'min') factor = 1.0 / 60.0;
+
+        const quantities = args.slice(0, -1);
+        for (const q of quantities) {
+          if (TAPE_SYNONYMS.includes(q))    unitsTape    = factor;
+          else if (COMPASS_SYNONYMS.includes(q)) unitsCompass = factor;
+          else if (CLINO_SYNONYMS.includes(q))   unitsClino   = factor;
+          else if (LRUD_QUANTITIES.includes(q))  unitsLRUD    = factor;
+        }
+      }
+      continue;
+    }
+
+    // Skip all other commands
+    if (trimmed.startsWith('*')) continue;
+
+    // Skip nosurvey blocks
+    if (dataType === 'nosurvey') continue;
+
+    // Data line
+    if (parts.length < 3) continue;
+
+    const fromIdx    = dataFields.indexOf('from');
+    const toIdx      = dataFields.indexOf('to');
+    const tapeIdx    = findFieldIdx(dataFields, TAPE_SYNONYMS);
+    const compassIdx = findFieldIdx(dataFields, COMPASS_SYNONYMS);
+    const clinoIdx   = findFieldIdx(dataFields, CLINO_SYNONYMS);
+    const leftIdx    = dataFields.indexOf('left');
+    const rightIdx   = dataFields.indexOf('right');
+    const upIdx      = findFieldIdx(dataFields, UP_SYNONYMS);
+    const downIdx    = findFieldIdx(dataFields, DOWN_SYNONYMS);
+
+    if (fromIdx === -1 || toIdx === -1 || tapeIdx === -1) continue;
+    if (parts.length <= Math.max(fromIdx, toIdx, tapeIdx)) continue;
+
+    const fromName = parts[fromIdx];
+    const toName   = parts[toIdx];
+
+    // Skip splays (to-station is '-' or '.')
+    if (!toName || toName === '-' || toName === '.') continue;
+    if (!fromName || fromName === '-') continue;
+
+    const tapeRaw = parseFloat(parts[tapeIdx]);
+    if (isNaN(tapeRaw) || tapeRaw < 0) continue;
+    const tape = tapeRaw * unitsTape;
+
+    const compassVal = compassIdx !== -1 && parts[compassIdx] && parts[compassIdx] !== '-'
+      ? parseFloat(parts[compassIdx]) : 0;
+    const compass = isNaN(compassVal) ? 0 : compassVal * unitsCompass;
+
+    const clinoVal = clinoIdx !== -1 && parts[clinoIdx] && parts[clinoIdx] !== '-'
+      ? parseFloat(parts[clinoIdx]) : 0;
+    const clino = isNaN(clinoVal) ? 0 : clinoVal * unitsClino;
+
+    const left  = leftIdx  !== -1 && parts[leftIdx]  ? parseLRUD(parts[leftIdx])  * unitsLRUD : 0;
+    const right = rightIdx !== -1 && parts[rightIdx] ? parseLRUD(parts[rightIdx]) * unitsLRUD : 0;
+    const up    = upIdx    !== -1 && parts[upIdx]    ? parseLRUD(parts[upIdx])    * unitsLRUD : 0;
+    const down  = downIdx  !== -1 && parts[downIdx]  ? parseLRUD(parts[downIdx])  * unitsLRUD : 0;
+
+    const seriesPath = seriesStack.join('.');
+    const gang = getGangId(seriesPath);
+    const fromStation = { gang, punkt: getPunktId(gang, fromName) };
+    const toStation   = { gang, punkt: getPunktId(gang, toName) };
+
+    const fromKey = `${gang}:${fromName}`;
+    const toKey   = `${gang}:${toName}`;
+    const origin  = stationCoords.get(fromKey) || { x: 0, y: 0, z: 0 };
+    const target  = calculateTargetCoordinates(origin, tape, compass, clino);
+
+    if (!stationCoords.has(fromKey)) stationCoords.set(fromKey, origin);
+    if (!stationCoords.has(toKey))   stationCoords.set(toKey, target);
+
+    shots.push({
+      fromStation,
+      toStation,
+      fromRaw: fromName,
+      toRaw: toName,
+      length: tape,
+      azimuth: compass,
+      inclination: clino,
+      left, right, up, down,
+      refX: origin.x,
+      refY: origin.y,
+      refZ: origin.z,
+      x: target.x,
+      y: target.y,
+      z: target.z
+    });
+  }
+
+  return shots;
+}
+
+/**
+ * Build a CaveRenderPro XML string from a pre-parsed shots array.
+ */
+function buildCaveRenderXML(shots, caveInfo) {
   caveInfo = normalizeCaveInfo(caveInfo);
-  const shots = parseSurveyShots(troText);
   let xmlLines = '';
   let id = 0;
 
@@ -285,9 +556,11 @@ function troToCaveRenderXML(troText, caveInfo) {
   return xmlHeader + xmlLines + '\n</CaveRenderPro>';
 }
 
-function troToCaveRenderSurveyText(troText, caveInfo) {
+/**
+ * Build a CaveRenderPro survey-data TXT string from a pre-parsed shots array.
+ */
+function buildCaveRenderSurveyText(shots, caveInfo) {
   caveInfo = normalizeCaveInfo(caveInfo);
-  const shots = parseSurveyShots(troText);
   const surveyDate = formatSurveyDate(caveInfo.datum);
   const caveKey = caveInfo.höhle || caveInfo.name;
   const rows = [
@@ -352,6 +625,31 @@ function troToCaveRenderSurveyText(troText, caveInfo) {
   return rows.join('\n');
 }
 
+/**
+ * Convert VTopo .tro text to CaveRenderPro XML string.
+ */
+function troToCaveRenderXML(troText, caveInfo) {
+  return buildCaveRenderXML(parseSurveyShots(troText), caveInfo);
+}
+
+function troToCaveRenderSurveyText(troText, caveInfo) {
+  return buildCaveRenderSurveyText(parseSurveyShots(troText), caveInfo);
+}
+
+/**
+ * Convert Survex .svx text to CaveRenderPro XML string.
+ */
+function svxToCaveRenderXML(svxText, caveInfo) {
+  return buildCaveRenderXML(parseSvxShots(svxText), caveInfo);
+}
+
+/**
+ * Convert Survex .svx text to CaveRenderPro survey-data TXT string.
+ */
+function svxToCaveRenderSurveyText(svxText, caveInfo) {
+  return buildCaveRenderSurveyText(parseSvxShots(svxText), caveInfo);
+}
+
 /** Escape special XML characters. */
 function escapeXml(str) {
   return String(str)
@@ -362,8 +660,9 @@ function escapeXml(str) {
     .replace(/'/g, '&apos;');
 }
 
-/** Module-level storage for the loaded .tro file text. */
-let currentTroText = null;
+/** Module-level storage for the loaded file. */
+let currentFileText = null;
+let currentFileType = null; // 'tro' or 'svx'
 
 function getSelectedExportFormat() {
   return document.getElementById('exportFormat').value;
@@ -400,27 +699,34 @@ function onFileSelected(input) {
   const file = input.files[0];
   if (!file) return;
 
-  currentTroText = null; // reset while loading
+  const isSvx = file.name.toLowerCase().endsWith('.svx');
+  currentFileType = isSvx ? 'svx' : 'tro';
+  currentFileText = null; // reset while loading
   document.getElementById('fileName').textContent = file.name;
   document.getElementById('downloadLink').style.display = 'none';
   showStatus('Reading file…', 'info');
 
   const reader = new FileReader();
   reader.onload = function(e) {
-    const troText = e.target.result;
+    const fileText = e.target.result;
 
-    // Count real survey shots (skip header lines and splay shots)
-    const lines = troText.split(/\r?\n/);
-    let dataLines = 0;
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || /^[A-Za-z\[*]/.test(trimmed)) continue;
-      const parts = trimmed.split(/\s+/);
-      if (isDataLine(parts)) dataLines++;
+    // Count real survey shots
+    let dataLines;
+    if (isSvx) {
+      dataLines = parseSvxShots(fileText).length;
+    } else {
+      const lines = fileText.split(/\r?\n/);
+      dataLines = 0;
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || /^[A-Za-z\[*]/.test(trimmed)) continue;
+        const parts = trimmed.split(/\s+/);
+        if (isDataLine(parts)) dataLines++;
+      }
     }
 
     // Parse header info
-    const info = parseTroHeader(troText);
+    const info = isSvx ? parseSvxHeader(fileText) : parseTroHeader(fileText);
 
     // Pre-fill form fields
     document.getElementById('caveName').value    = info.name    || '';
@@ -440,20 +746,20 @@ function onFileSelected(input) {
     document.getElementById('step3').style.display = '';
 
     // Store text for conversion
-    currentTroText = troText;
+    currentFileText = fileText;
 
     showStatus('File loaded — ' + dataLines + ' survey shots found.', 'success');
   };
 
-  // Read as Latin-1 (ISO-8859-1) — the standard encoding for VTopo .tro files
-  reader.readAsText(file, 'iso-8859-1');
+  // SVX files are UTF-8; TRO files use Latin-1 (ISO-8859-1)
+  reader.readAsText(file, isSvx ? 'utf-8' : 'iso-8859-1');
 }
 
 /** Called when the user clicks "Convert". */
 function convertFile() {
   const fileInput = document.getElementById('troFile');
-  if (!fileInput.files[0] || !currentTroText) {
-    return showStatus('Please select a .tro file first.', 'error');
+  if (!fileInput.files[0] || !currentFileText) {
+    return showStatus('Please select a .tro or .svx file first.', 'error');
   }
 
   const caveInfo = {
@@ -464,9 +770,16 @@ function convertFile() {
     datum:    document.getElementById('caveDate').value   || new Date().toISOString().slice(0, 10)
   };
   const exportFormat = getSelectedExportFormat();
-  const content = exportFormat === 'survey'
-    ? troToCaveRenderSurveyText(currentTroText, caveInfo)
-    : troToCaveRenderXML(currentTroText, caveInfo);
+  let content;
+  if (currentFileType === 'svx') {
+    content = exportFormat === 'survey'
+      ? svxToCaveRenderSurveyText(currentFileText, caveInfo)
+      : svxToCaveRenderXML(currentFileText, caveInfo);
+  } else {
+    content = exportFormat === 'survey'
+      ? troToCaveRenderSurveyText(currentFileText, caveInfo)
+      : troToCaveRenderXML(currentFileText, caveInfo);
+  }
   const mimeType = exportFormat === 'survey'
     ? 'text/tab-separated-values;charset=utf-8'
     : 'application/xml;charset=utf-8';
@@ -480,7 +793,7 @@ function convertFile() {
     URL.revokeObjectURL(link.href);
   }
   link.href = url;
-  const inputName = fileInput.files[0].name.replace(/\.tro$/i, '');
+  const inputName = fileInput.files[0].name.replace(/\.(tro|svx)$/i, '');
   link.download = exportFormat === 'survey'
     ? inputName + '_caverender_survey.txt'
     : inputName + '_caverender.xml';
